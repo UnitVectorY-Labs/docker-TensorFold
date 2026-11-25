@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM nvidia/cuda:13.4.3-devel-ubuntu24.04 AS builder
+FROM nvidia/cuda:13.5.0-devel-ubuntu24.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
@@ -84,7 +84,7 @@ RUN set -eux; \
         -Dtarget="${ZIG_ARCH}-linux-gnu.2.28" \
         -Dxgrammar=/src/xgrammar
 
-FROM nvidia/cuda:13.4.3-runtime-ubuntu24.04 AS runtime
+FROM nvidia/cuda:13.5.0-runtime-ubuntu24.04 AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG APP_USER=tensorfold
