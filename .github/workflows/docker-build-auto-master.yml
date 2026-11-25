@@ -1,0 +1,164 @@
+name: Build and Push Master Docker Images
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - .github/workflows/docker-build-auto-master.yml
+      - Dockerfile
+  schedule:
+    - cron: '0 2 * * 6'
+  workflow_dispatch:
+
+# Both publishers and their cleanup jobs operate on the same GHCR package.
+concurrency:
+  group: docker
+
+jobs:
+  build-and-push:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set lowercase repository name
+      run: |
+        echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+    - name: Build and push Docker image (single arch)
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: .
+        push: true
+        sbom: true
+        provenance: true
+        platforms: linux/${{ matrix.arch }}
+        build-args: |
+          TENSORFOLD_GPU=spark
+          TENSORFOLD_REF=main
+        tags: ghcr.io/${{ env.REPO_LC }}:master-${{ matrix.arch }}
+
+  manifest:
+    needs: build-and-push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set lowercase repository name
+      run: |
+        echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+    - name: Create and push multi-arch manifest tag
+      shell: bash
+      run: |
+        IMAGE="ghcr.io/${REPO_LC}"
+
+        docker buildx imagetools create \
+          -t "${IMAGE}:master" \
+          "${IMAGE}:master-amd64" \
+          "${IMAGE}:master-arm64"
+
+        docker buildx imagetools inspect "${IMAGE}:master"
+
+        # Fetch every child; inspecting the index alone misses deleted manifests.
+        MANIFESTS=$(docker buildx imagetools inspect "${IMAGE}:master" --raw)
+        DIGESTS=$(jq -er '.manifests[].digest' <<< "$MANIFESTS")
+        while IFS= read -r DIGEST; do
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" > /dev/null
+        done <<< "$DIGESTS"
+
+  cleanup:
+    needs: manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Set lowercase package name
+      shell: bash
+      run: |
+        PACKAGE_NAME=${GITHUB_REPOSITORY##*/}
+        echo "PACKAGE_NAME_LC=${PACKAGE_NAME,,}" >> "$GITHUB_ENV"
+        echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Clean up untagged Docker images
+      uses: UnitVectorY-Labs/delete-package-versions@1ca5e6ebabb7169ddb0e0afc62403eec27832c31 # v5.0.1-uvy.1
+      with:
+        owner: ${{ github.repository_owner }}
+        package-name: ${{ env.PACKAGE_NAME_LC }}
+        package-type: container
+        min-versions-to-keep: 5
+        delete-only-untagged-versions: 'true'
+
+    - name: Verify published images and attestations after cleanup
+      shell: bash
+      run: |
+        IMAGE="ghcr.io/${REPO_LC}"
+        for TAG in current master; do
+          if ! MANIFEST=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --raw 2>/dev/null); then
+            if [ "${TAG}" = "master" ]; then
+              echo "Expected tag ${TAG} is missing" >&2
+              exit 1
+            fi
+            echo "Optional tag ${TAG} not published yet; skipping"
+            continue
+          fi
+          DIGESTS=$(jq -er '.manifests[].digest' <<< "$MANIFEST")
+          while IFS= read -r DIGEST; do
+            docker buildx imagetools inspect "${IMAGE}@${DIGEST}" > /dev/null
+          done <<< "$DIGESTS"
+        done
